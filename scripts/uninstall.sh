@@ -1,131 +1,93 @@
-#!/bin/bash
-# 卸载 neu-box-runtime / neu-box-hook，并把 daemon.json 还原回安装前的样子。
+#!/bin/sh
+# 卸载 neu-box-runtime，并把 daemon.json 还原。
 #
-# ⚠️ 顺序是硬要求，方向和 install.sh 相反：**先还原 daemon.json，再删二进制**。
-#    default-runtime 还指着 neu-box 的时候把二进制删掉，dockerd 会起不了任何
-#    容器。
+# 顺序和 install.sh 相反，但同样是硬的：**先还原 daemon.json，再删二进制**。
+# default-runtime 还指着 neu-box-runtime 的时候把二进制删掉，dockerd 会起不了任何容器。
 #
-# ⚠️ 还原用的是安装时的备份 $DAEMON.neu-box-bak。那是一份**快照**：安装之后你手工
-#    改过 daemon.json 的话，还原会把那些改动一起抹掉。没有备份（装机时 daemon.json
-#    本来不存在）时改成外科手术式地摘掉我们加的两个键。
+# daemon.json 改完要重启 dockerd 才生效；本脚本不替你重启。
 #
-# ⚠️ 和安装时一样，daemon.json 改完要重启 dockerd 才生效；脚本不会替你重启。
-#
-# 用法：
-#   sudo bash scripts/uninstall.sh            # 还原 + 删二进制，保留 runtime.env
-#   sudo bash scripts/uninstall.sh --purge    # 连 /etc/neu-box/runtime.env 一起删
-set -euo pipefail
+# 二进制是 RPM 装的话（deploy/rpm/），本脚本只还原 daemon.json，文件交给
+# `sudo dnf remove neu-box-runtime`。包自己的 %preun 也认这条规矩：daemon.json 还
+# 指着 neu-box-runtime 时拒绝卸载 —— 和上面那条顺序是同一件事，只是换了个方向守。
+set -eu
 
-BIN_DIR=/usr/local/bin
-RUNTIME_BIN="$BIN_DIR/neu-box-runtime"
-HOOK_BIN="$BIN_DIR/neu-box-hook"
-CONF_DIR=/etc/neu-box
-CONF="$CONF_DIR/runtime.env"
+BIN=/usr/local/bin
+CONF=/etc/neu-box/runtime.env
 DAEMON=/etc/docker/daemon.json
-DAEMON_BAK="$DAEMON.neu-box-bak"
+BAK=$DAEMON.neu-box-bak
 
-purge=0
+purge=
 for arg in "$@"; do
-    case "$arg" in
+    case $arg in
         --purge) purge=1 ;;
-        -h|--help) sed -n '2,20p' "${BASH_SOURCE[0]}"; exit 0 ;;
-        *) echo "未知参数：$arg（--help 看用法）" >&2; exit 2 ;;
+        -h|--help)
+            cat <<'EOF'
+用法: sudo bash scripts/uninstall.sh [--purge]
+
+  --purge  连 /etc/neu-box/runtime.env 一起删
+EOF
+            exit 0 ;;
+        *) echo "未知参数: $arg（--help 看用法）" >&2; exit 2 ;;
     esac
 done
 
-die() { echo "❌ $*" >&2; exit 1; }
-say() { echo "── $*"; }
-
+die() { echo "uninstall: $*" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || die "需要 root：sudo bash $0"
 
-# ────────────────────────────────────────────────────────────────────────────
-say "1/4 还原 $DAEMON（必须在删二进制之前）"
-# ────────────────────────────────────────────────────────────────────────────
-if [ -f "$DAEMON_BAK" ]; then
-    cp -a "$DAEMON_BAK" "$DAEMON"
-    echo "已从 $DAEMON_BAK 还原（安装时的快照；装完之后手工改过的内容会被覆盖）"
+# ── 1. 还原 daemon.json（必须在删二进制之前）─────────────────────────────
+if [ -f "$BAK" ]; then
+    # 备份是安装时的快照，装完之后手工改过的内容会被一起抹掉。
+    cp -a "$BAK" "$DAEMON"
+    echo "已从 $BAK 还原"
 elif [ -f "$DAEMON" ]; then
-    command -v python3 >/dev/null || die "没有备份，又需要 python3 来摘键"
-    python3 - "$DAEMON" <<'PY'
-import json
-import sys
-
-path = sys.argv[1]
-with open(path, encoding='utf-8') as stream:
-    raw = stream.read().strip()
-config = json.loads(raw) if raw else {}
-if not isinstance(config, dict):
-    raise SystemExit(f'❌ {path} 顶层不是 JSON 对象，拒绝改')
-
-changed = []
-if config.get('default-runtime') == 'neu-box':
-    del config['default-runtime']
-    changed.append('default-runtime')
-else:
-    kept = config.get('default-runtime')
-    if kept:
-        print(f'ℹ️  default-runtime 是 {kept!r}，不是 neu-box，没动它')
-
-runtimes = config.get('runtimes')
-if isinstance(runtimes, dict) and 'neu-box' in runtimes:
-    del runtimes['neu-box']
-    changed.append('runtimes.neu-box')
-    if not runtimes:
-        del config['runtimes']
-
-with open(path, 'w', encoding='utf-8') as stream:
-    json.dump(config, stream, indent=4)
-    stream.write('\n')
-
-print('  摘掉的键：' + (', '.join(changed) if changed else '（没有）'))
-PY
+    # 装机时 daemon.json 本来不存在，没有快照可还，只能摘掉我们加的两个键。
+    command -v jq >/dev/null || die "需要 jq 来摘键"
+    jq -e 'type == "object"' "$DAEMON" >/dev/null || die "$DAEMON 顶层不是 JSON 对象，拒绝改"
+    jq 'if .["default-runtime"] == "neu-box-runtime" then del(.["default-runtime"]) else . end
+        | if (.runtimes | type) == "object" then del(.runtimes["neu-box-runtime"]) else . end
+        | if .runtimes == {} then del(.runtimes) else . end' \
+        "$DAEMON" > "$DAEMON.new" && mv "$DAEMON.new" "$DAEMON"
+    echo "已摘掉 default-runtime / runtimes.neu-box-runtime"
 else
     echo "没有 $DAEMON，跳过"
 fi
 
-# ────────────────────────────────────────────────────────────────────────────
-say "2/4 删除二进制"
-# ────────────────────────────────────────────────────────────────────────────
-for binary in "$RUNTIME_BIN" "$HOOK_BIN"; do
-    if [ -e "$binary" ]; then
-        rm -f "$binary"
-        echo "已删除 $binary"
-    else
-        echo "$binary 本来就不在"
-    fi
-done
+# ── 2. 删二进制 ──────────────────────────────────────────────────────────
+# RPM 装的交给包管理器删：脚本 rm 掉包里的文件，包数据库就过期了（rpm -V 会一直
+# 报缺失）。daemon.json 上一步已经还原，这时候删是安全的，dnf remove 同理。
+rpm_owned=
+if command -v rpm >/dev/null 2>&1 && rpm -qf "$BIN/neu-box-runtime" >/dev/null 2>&1; then
+    rpm_owned=1
+else
+    rm -f "$BIN/neu-box-runtime" "$BIN/neu-box-hook"
+fi
 
-# ────────────────────────────────────────────────────────────────────────────
-say "3/4 配置文件"
-# ────────────────────────────────────────────────────────────────────────────
-if [ "$purge" = 1 ]; then
+# ── 3. 配置文件 ──────────────────────────────────────────────────────────
+if [ -n "$purge" ]; then
+    # 这份配置不归包管（是 neu-box-config 生成的），dnf remove 不会碰它，
+    # --purge 就自己删。
     rm -f "$CONF"
+    rmdir /etc/neu-box 2>/dev/null || true       # 空才删得掉
     echo "已删除 $CONF"
-    # 备份文件留着：里面可能有你手工改过的东西，不该由脚本替你决定。
-    if compgen -G "$CONF.bak.*" >/dev/null; then
-        echo "保留备份：$(ls -1 "$CONF.bak."* | tr '\n' ' ')（要删自己删）"
-    fi
-    if [ -d "$CONF_DIR" ] && [ -z "$(ls -A "$CONF_DIR")" ]; then
-        rmdir "$CONF_DIR"
-        echo "已删除空目录 $CONF_DIR"
-    fi
 else
     echo "保留 $CONF（要一起删：sudo bash $0 --purge）"
 fi
 
-# ────────────────────────────────────────────────────────────────────────────
-say "4/4 完成 —— 但还没有生效"
-# ────────────────────────────────────────────────────────────────────────────
-cat <<'EOF'
+cat <<EOF
 
-接下来必须手工做（脚本不替你重启 dockerd）：
+还得手工做（脚本不替你重启 dockerd，重启会杀掉所有运行中的容器）：
 
-  1) 先看看有哪些容器会被重启杀掉：   docker ps
-  2) 重启 dockerd：                   systemctl restart docker
-  3) 确认 neu-box 已经不在 runtime 列表里：
-       docker info --format '{{.DefaultRuntime}} {{.Runtimes}}'
-
-注意：重启 dockerd 会杀掉当时所有运行中的容器。
-
-（重装：sudo bash scripts/install.sh ）
+    docker ps
+    systemctl restart docker
+    docker info --format '{{.DefaultRuntime}}'   # 不应再是 neu-box-runtime
 EOF
+
+if [ -n "$rpm_owned" ]; then
+    cat <<EOF
+
+二进制还归 RPM 管，重启完之后再删包（反了 dockerd 会起不了容器）。runtime.env
+不归包管：包不会删它，要清就 `sudo bash $0 --purge`：
+
+    sudo dnf remove neu-box-runtime
+EOF
+fi

@@ -1,10 +1,11 @@
 // neu-box-runtime：neu-box 的 runc wrapper。
 //
-// 它在 /etc/docker/daemon.json 里占 runc 的位置，并且是 **default-runtime**：
+// 它在 /etc/docker/daemon.json 里占 runc 的位置，并且是 **default-runtime**
+// （键和值都叫 neu-box-runtime，和二进制同名）：
 //
 //	{
-//	  "default-runtime": "neu-box",
-//	  "runtimes": { "neu-box": { "path": "/usr/local/bin/neu-box-runtime" } }
+//	  "default-runtime": "neu-box-runtime",
+//	  "runtimes": { "neu-box-runtime": { "path": "/usr/local/bin/neu-box-runtime" } }
 //	}
 //
 // 也就是说这台机器上所有容器（包括跟我们完全无关的业务容器）的启动都从这条路

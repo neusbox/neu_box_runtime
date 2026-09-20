@@ -1,224 +1,167 @@
-#!/bin/bash
-# 安装 neu-box-runtime 与 neu-box-hook，并把 neu-box 设成 Docker 的默认 runtime。
+#!/bin/sh
+# 安装/升级 neu-box-runtime（runc wrapper + OCI hook + 配置工具），并设为 Docker
+# 默认 runtime。
 #
-# ⚠️ neu-box 是 **default-runtime**：这台机器上所有容器（包括跟我们完全无关的
-#    业务容器）的启动都要经过 /usr/local/bin/neu-box-runtime。所以顺序是硬要求：
+# 三件事，顺序是硬的：
 #
-#        1. 装二进制
-#        2. 验证它能执行（跑得起来、找得到真 runtime）
-#        3. 最后才改 daemon.json
+#   1. dnf 装二进制。包只落文件 —— 不碰 daemon.json，也不碰配置。
+#   2. neu-box-config 生成/迁移 /etc/neu-box/runtime.env。配置归应用自己管：
+#      包和这个脚本都不再手写它的内容，只把现场发现的事实（真 runc 的路径、
+#      worker 的地址）交给它。
+#   3. 改 daemon.json，把这台机器的 default-runtime 指过来。
 #
-#    default-runtime 指向一个不存在或跑不起来的二进制，dockerd 会**起不了任何
-#    容器**。顺序反了就可能落到这个状态。
+# 为什么第 3 步必须最后：neu-box-runtime 是这台机器的 default-runtime，**所有**
+# 容器（包括跟我们无关的业务容器）启动都要过它。指向一个跑不起来的二进制，
+# dockerd 会起不了任何容器。所以先验证它真能注入，再改全局配置。
 #
-# ⚠️ runtimes / default-runtime **不支持热加载**：改完必须重启 dockerd，重启会杀掉
-#    当时所有运行中的容器。这个脚本**不会**替你重启，只把命令打出来。
+# runtimes / default-runtime 不支持热加载，改完必须重启 dockerd（会杀掉当时所有
+# 运行中的容器）。本脚本不替你重启。
 #
-# ⚠️ 改 daemon.json 之前会备份到 $DAEMON.neu-box-bak。uninstall.sh 靠它还原。
-#
-# 用法：
-#   sudo bash scripts/install.sh              # 编译 + 安装
-#   sudo bash scripts/install.sh --no-build   # 用 dist/ 里已有的二进制
-#   sudo bash scripts/install.sh --force      # 覆盖已存在的 runtime.env（先备份）
-set -euo pipefail
+# 升级也走这个脚本，同一个入口：换二进制、迁移配置、确认 daemon.json，一次做完。
+set -eu
 
-BIN_DIR=/usr/local/bin
-RUNTIME_BIN="$BIN_DIR/neu-box-runtime"
-HOOK_BIN="$BIN_DIR/neu-box-hook"
-CONF_DIR=/etc/neu-box
-CONF="$CONF_DIR/runtime.env"
-WORKER_CONF="$CONF_DIR/worker.env"
+BIN=/usr/local/bin
+RUNTIME=$BIN/neu-box-runtime
+HOOK=$BIN/neu-box-hook
+CONFIG_BIN=$BIN/neu-box-config
+CONF=/etc/neu-box/runtime.env
+WORKER_CONF=/etc/neu-box/worker.env
 DAEMON=/etc/docker/daemon.json
-DAEMON_BAK="$DAEMON.neu-box-bak"
+BAK=$DAEMON.neu-box-bak
 DEFAULT_PORT=59075
-# 注入的 OCI hook 阶段。默认 createRuntime（契约默认值）：直连 runc 验过，且
-# prestart 在 OCI 规范里已废弃。prestart 仍然能用、也仍然重要 —— 整条 Docker
-# 链路上验过的只有它，createRuntime 在完整链路上还没跑过，出问题就切回它。
-DEFAULT_PHASE=createRuntime
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-
-build=1
-force=0
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+rpm_arg=
+no_pack=
+force=
 for arg in "$@"; do
-    case "$arg" in
-        --no-build) build=0 ;;
-        --force) force=1 ;;
-        -h|--help) sed -n '2,28p' "${BASH_SOURCE[0]}"; exit 0 ;;
-        *) echo "未知参数：$arg（--help 看用法）" >&2; exit 2 ;;
+    case $arg in
+        --rpm=*)    rpm_arg=${arg#--rpm=} ;;
+        --no-build) no_pack=1 ;;
+        --force)    force=1 ;;
+        -h|--help)
+            cat <<'EOF'
+用法: sudo bash scripts/install.sh [选项]
+
+  --rpm=<文件>   装这个 RPM。默认用 dist/rpm/ 里最新的；找不到就现场打一个
+  --no-build     不打包，只用 dist/rpm/ 里已有的 RPM
+  --force        把 runtime.env 整份重写（默认只迁移/补键，手改过的值不动）
+
+装完还得手工重启 dockerd（会杀掉当时所有运行中的容器）：
+    docker ps && sudo systemctl restart docker
+EOF
+            exit 0 ;;
+        *) echo "未知参数: $arg（--help 看用法）" >&2; exit 2 ;;
     esac
 done
 
-die() { echo "❌ $*" >&2; exit 1; }
-say() { echo "── $*"; }
-
+die() { echo "install: $*" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || die "需要 root：sudo bash $0"
 
-# ────────────────────────────────────────────────────────────────────────────
-say "1/6 编译二进制（CGO_ENABLED=0，静态；目标机不需要 glibc 匹配）"
-# ────────────────────────────────────────────────────────────────────────────
-runtime_src="$ROOT/dist/neu-box-runtime"
-hook_src="$ROOT/dist/neu-box-hook"
-if [ "$build" = 1 ]; then
-    command -v go >/dev/null || die "找不到 go；用 --no-build 走 dist/ 里已有的二进制"
-    mkdir -p "$ROOT/dist"
-    ( cd "$ROOT" && CGO_ENABLED=0 go build -trimpath -ldflags '-s -w' \
-        -o dist/neu-box-runtime ./cmd/neu-runtime )
-    ( cd "$ROOT" && CGO_ENABLED=0 go build -trimpath -ldflags '-s -w' \
-        -o dist/neu-box-hook ./cmd/neu-hook )
-fi
-[ -f "$runtime_src" ] || die "没有 $runtime_src（先编译，或去掉 --no-build）"
-[ -f "$hook_src" ] || die "没有 $hook_src（先编译，或去掉 --no-build）"
+command -v jq >/dev/null || die "需要 jq（改 daemon.json 用）"
+command -v dnf >/dev/null || die "需要 dnf 装二进制"
 
-# ────────────────────────────────────────────────────────────────────────────
-say "2/6 安装二进制到 $BIN_DIR"
-# ────────────────────────────────────────────────────────────────────────────
-# 真 runtime 从 PATH 里找，不写死：契约的默认值是 /usr/local/bin/runc，但不同装机
-# 方式（RPM、官方脚本）落点不一样。
-real_runc="${NEU_BOX_REAL_RUNC:-$(command -v runc || true)}"
-[ -n "$real_runc" ] || die "找不到 runc；先装 runc，或显式给 NEU_BOX_REAL_RUNC=/path/to/runc"
-echo "真 runtime：$real_runc"
-
-install -m 0755 "$runtime_src" "$RUNTIME_BIN"
-install -m 0755 "$hook_src" "$HOOK_BIN"
-# SELinux（本机 daemon.json 里 selinux-enabled: true）下新文件要有正确的标签，
-# 否则 dockerd 起容器时可能被拒。
-if command -v restorecon >/dev/null; then
-    restorecon -v "$RUNTIME_BIN" "$HOOK_BIN" 2>/dev/null || true
-fi
-
-# ────────────────────────────────────────────────────────────────────────────
-say "3/6 验证二进制能执行 —— 在动 daemon.json 之前"
-# ────────────────────────────────────────────────────────────────────────────
-# --help 会原样转发给真 runtime，等于同时验证了"wrapper 跑得起来"和"它能找到
-# 真 runc"这两件事。这里失败就绝不碰 daemon.json。
-if ! NEU_BOX_REAL_RUNC="$real_runc" "$RUNTIME_BIN" --help >/dev/null 2>&1; then
-    die "错误：$RUNTIME_BIN --help 跑不通（真 runtime 是 $real_runc），daemon.json 保持不变"
-fi
-echo "✅ wrapper 可执行，且能把 argv 转发给 $real_runc"
-
-# hook 喂一个空 state：应当很快退非零（"state 里没有 sandbox_cgroup"），
-# 既证明它能跑，也证明它不会在缺参数时挂死。非零在这里是期望值。
-hook_rc=0
-printf '{}' | timeout 5 "$HOOK_BIN" >/dev/null 2>&1 || hook_rc=$?
-if [ "$hook_rc" = 0 ]; then
-    die "错误：$HOOK_BIN 收到空 state 竟然退 0，登记逻辑不对，daemon.json 保持不变"
-fi
-if [ "$hook_rc" = 124 ]; then
-    die "错误：$HOOK_BIN 挂死了（5s 没退），daemon.json 保持不变"
-fi
-echo "✅ hook 可执行（空 state 退 $hook_rc，符合预期）"
-
-# ────────────────────────────────────────────────────────────────────────────
-say "4/6 生成 $CONF"
-# ────────────────────────────────────────────────────────────────────────────
-mkdir -p "$CONF_DIR"
-chmod 0750 "$CONF_DIR"
-if [ -f "$CONF" ] && [ "$force" != 1 ]; then
-    echo "已存在，原样保留（要重写加 --force）"
-else
-    if [ -f "$CONF" ]; then
-        backup="$CONF.bak.$(date +%Y%m%d%H%M%S)"
-        cp -a "$CONF" "$backup"
-        echo "已备份 → $backup"
+# ── 1. 找一个 RPM（装或升级都走它） ──────────────────────────────────────
+# 二进制归包管理器管：升级只替换 /usr/local/bin 下那几个文件，路径不变，也不会
+# 和手工 install 的文件互相覆盖（那种覆盖会让 rpm -V 一直报校验和不符）。
+if [ -z "$rpm_arg" ]; then
+    if [ -z "$no_pack" ]; then
+        echo "没指定 --rpm，现场打一个……"
+        bash "$ROOT/deploy/rpm/build_rpm.sh"
     fi
-    # 端口从 worker.env 里读，不写死：NEU_BOX_WORKER_URL 的端口和 worker 的
-    # NEU_BOX_PORT 是同一件事，写死就会漂（契约里点名的"一份事实两处描述"）。
-    worker_port=""
-    if [ -f "$WORKER_CONF" ]; then
-        worker_port=$(sed -n 's/^[[:space:]]*\(export[[:space:]]\+\)\?NEU_BOX_PORT[[:space:]]*=[[:space:]]*//p' "$WORKER_CONF" \
-            | tail -n 1 | tr -d '"' | tr -d "'" | tr -d '[:space:]')
-    fi
-    case "$worker_port" in
-        ''|*[!0-9]*)
-            echo "⚠️  没从 $WORKER_CONF 读到 NEU_BOX_PORT，用默认端口 $DEFAULT_PORT"
-            echo "     worker 改了端口的话，$CONF 里的 NEU_BOX_WORKER_URL 要跟着改"
-            worker_port="$DEFAULT_PORT"
-            ;;
-        *) echo "从 $WORKER_CONF 读到端口 $worker_port" ;;
-    esac
+    rpm_arg=$(ls -1t "$ROOT"/dist/rpm/neu-box-runtime-*.rpm 2>/dev/null | head -1 || true)
+    [ -n "$rpm_arg" ] || die "dist/rpm/ 里没有 RPM（去掉 --no-build，或用 --rpm=<文件>）"
+fi
+[ -f "$rpm_arg" ] || die "RPM 不存在：$rpm_arg"
+echo "用 $rpm_arg"
 
-    cat > "$CONF" <<EOF
-# Neu Box Runtime configuration —— 见 deploy/config/runtime.env.example。
-# 由 scripts/install.sh 生成（$(date -Is)）。
-# 环境变量优先于此文件；NEU_BOX_CONFIG 可以指向另一个文件。
+# 已经装了同一个版本时 dnf 会说"nothing to do"，那不是错误。
+dnf install -y "$rpm_arg" || die "dnf 装包失败"
 
-NEU_BOX_WORKER_URL=http://127.0.0.1:$worker_port
-NEU_BOX_HOOK=$HOOK_BIN
-# 整条 Docker 链路上验过的是 prestart；createRuntime 只直连 runc 验过。
-# 真机第一次跑 createRuntime，出问题就把这行改成 prestart。
-NEU_BOX_HOOK_PHASE=$DEFAULT_PHASE
-NEU_BOX_REAL_RUNC=$real_runc
-EOF
-    # 和 worker.env 一致：%attr(0640,root,root)。
-    chown root:root "$CONF"
-    chmod 0640 "$CONF"
-    echo "已写入 $CONF"
+for bin in "$RUNTIME" "$HOOK" "$CONFIG_BIN"; do
+    [ -x "$bin" ] || die "$bin 不在或不可执行（包没装成？）"
+done
+
+# ── 2. 把现场发现的事实交给 neu-box-config ───────────────────────────────
+# 为什么发现动作留在这个脚本里、而不是让二进制自己去 LookPath：dockerd 的环境
+# 未必有 /usr/local/bin 在 PATH 上，运行时找不到真 runc；这里是运维的 shell，
+# PATH 是可信的。配置的 schema、版本、迁移归 neu-box-config，发现归脚本。
+real_runc=${NEU_BOX_REAL_RUNC:-$(command -v runc || true)}
+[ -n "$real_runc" ] || die "找不到 runc；或显式给 NEU_BOX_REAL_RUNC=/path/to/runc"
+
+port=$(sed -n 's/^NEU_BOX_PORT=//p' "$WORKER_CONF" 2>/dev/null | tail -1 | tr -cd '0-9')
+if [ -z "$port" ]; then
+    echo "没从 $WORKER_CONF 读到 NEU_BOX_PORT，用 $DEFAULT_PORT"
+    port=$DEFAULT_PORT
 fi
 
-# ────────────────────────────────────────────────────────────────────────────
-say "5/6 把 neu-box 设成默认 runtime（daemon.json）"
-# ────────────────────────────────────────────────────────────────────────────
-command -v python3 >/dev/null || die "需要一个 python3 来改 JSON"
-if [ -f "$DAEMON" ]; then
-    if [ -f "$DAEMON_BAK" ]; then
-        echo "备份已存在，保留旧的那份：$DAEMON_BAK"
-    else
-        cp -a "$DAEMON" "$DAEMON_BAK"
-        echo "已备份 → $DAEMON_BAK"
-    fi
-else
-    mkdir -p "$(dirname "$DAEMON")"
-    printf '{}\n' > "$DAEMON"
-    echo "$DAEMON 不存在，已新建（卸载时没有备份可还原，会改成删掉我们的键）"
+# 不加 --force 就是"迁移 + 补键 + 修还等于内置默认值的键"，手改过的值不动。
+set -- init --path "$CONF" --real-runc "$real_runc" \
+    --worker-url "http://127.0.0.1:$port" --hook "$HOOK"
+[ -z "$force" ] || set -- "$@" --force
+"$CONFIG_BIN" "$@" || die "生成/迁移 $CONF 失败"
+
+# ── 3. 验证 wrapper 真能注入 ─────────────────────────────────────────────
+# 只跑 --help 不算验证 —— 那压根没碰注入逻辑。这里拿临时 bundle + 假 runc 走
+# 一遍真路径：wrapper 读 config.json、注 hook、把 argv 转发给真 runtime。
+# 验的是**要部署的那一份**，也就是 dnf 刚换上去的那个。
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT INT TERM
+mkdir -p "$tmp/bundle"
+printf '%s' '#!/bin/sh
+printf "%s\n" "$*" > "$FAKE_RUNC_LOG"' > "$tmp/runc"
+chmod +x "$tmp/runc"
+# root 不参与注入，给个占位；关键是 annotations 里那条 sandbox_cgroup。
+printf '%s' '{"ociVersion":"1.0.2","root":{"path":"rootfs"},"annotations":{"sandbox_cgroup":"sbx_probe.slice"}}' \
+    > "$tmp/bundle/config.json"
+
+FAKE_RUNC_LOG=$tmp/argv NEU_BOX_REAL_RUNC=$tmp/runc \
+    "$RUNTIME" --root "$tmp/state" create --bundle "$tmp/bundle" probe \
+    || die "wrapper 跑不通"
+grep -q -- --bundle "$tmp/argv" || die "wrapper 没把 argv 转发给真 runtime"
+jq -e '.hooks | length > 0' "$tmp/bundle/config.json" >/dev/null \
+    || die "wrapper 没注入 hook（那是它存在的唯一理由）"
+
+# 空 state 应当退非零（缺 sandbox_cgroup），且不能挂死。
+if printf '{}' | timeout 5 "$HOOK" >/dev/null 2>&1; then
+    die "hook 收到空 state 竟然退 0，登记逻辑不对"
 fi
+echo "验证通过：wrapper 会注入 hook，hook 缺参数时拒绝"
 
-python3 - "$DAEMON" "$RUNTIME_BIN" <<'PY'
-import json
-import sys
+# ── 4. 配置指到的两个东西必须真在 ────────────────────────────────────────
+# NEU_BOX_REAL_RUNC 指错 = wrapper 找不到真 runtime，**任何容器都起不来**，和
+# default-runtime 指错一个后果。所以在改 daemon.json 之前拦下来。
+#
+# 取值宽容一点：引号、行尾注释、两边空白都当没写（和 config.go 的解析对齐）——
+# 这个检查宁可漏判也不能误判，误判会拦住一次本来能用的部署。
+for key in NEU_BOX_REAL_RUNC NEU_BOX_HOOK; do
+    value=$(sed -n "s/^$key=[[:space:]]*//p" "$CONF" 2>/dev/null | tail -1 | tr -d '"' | tr -d "'")
+    value=${value%%[[:space:]]*}
+    [ -n "$value" ] || continue      # 没写就用二进制的内置默认值
+    [ -x "$value" ] || die "$CONF 里 $key=$value 不存在或不可执行；改掉这一行，或加 --force 重写"
+done
 
-path, wrapper = sys.argv[1], sys.argv[2]
-with open(path, encoding='utf-8') as stream:
-    raw = stream.read().strip()
-config = json.loads(raw) if raw else {}
-if not isinstance(config, dict):
-    raise SystemExit(f'❌ {path} 顶层不是 JSON 对象，拒绝改')
+# ── 5. 注册成默认 runtime ────────────────────────────────────────────────
+[ -f "$DAEMON" ] || { mkdir -p "$(dirname "$DAEMON")"; echo '{}' > "$DAEMON"; }
+[ -f "$BAK" ] || cp -a "$DAEMON" "$BAK"
+jq -e 'type == "object"' "$DAEMON" >/dev/null || die "$DAEMON 顶层不是 JSON 对象，拒绝改"
+# 键和值都叫 neu-box-runtime：和二进制同名，也和 RPM 包同名。别退回短名
+# "neu-box" —— 那个名字同时被运维命令和 OCI runtime 占用过，运维命令已经改名成
+# neu-box-installer，这里再留短名就又分不清说的是谁了。
+jq --arg bin "$RUNTIME" \
+   '. + {"default-runtime":"neu-box-runtime"} | .runtimes["neu-box-runtime"] = {"path":$bin}' \
+   "$DAEMON" > "$DAEMON.new" || die "改 $DAEMON 失败"
+mv "$DAEMON.new" "$DAEMON"
+echo "已设 default-runtime=neu-box-runtime → $RUNTIME（备份 $BAK）"
 
-previous = config.get('default-runtime')
-config['default-runtime'] = 'neu-box'
-runtimes = config.setdefault('runtimes', {})
-if not isinstance(runtimes, dict):
-    raise SystemExit(f'❌ {path} 里的 runtimes 不是 JSON 对象，拒绝改')
-stale = runtimes.get('neu-box-hook')
-runtimes['neu-box'] = {'path': wrapper}
-
-with open(path, 'w', encoding='utf-8') as stream:
-    json.dump(config, stream, indent=4)
-    stream.write('\n')
-
-print(f'  default-runtime = neu-box')
-print(f'  runtimes.neu-box = {wrapper}')
-if previous and previous != 'neu-box':
-    print(f'⚠️  原来的 default-runtime 是 {previous!r}，已被覆盖；'
-          f'还原用 {path}.neu-box-bak', file=sys.stderr)
-if stale:
-    print(f'ℹ️  还留着实验期的 runtimes.neu-box-hook = {stale}，'
-          f'它只在显式 --runtime neu-box-hook 时用到，可手工删掉', file=sys.stderr)
-PY
-
-# ────────────────────────────────────────────────────────────────────────────
-say "6/6 完成 —— 但还没有生效"
-# ────────────────────────────────────────────────────────────────────────────
+# ── 6. 还没生效 ──────────────────────────────────────────────────────────
 cat <<EOF
 
-接下来必须手工做（脚本不替你重启 dockerd）：
+还得手工做（脚本不替你重启 dockerd，重启会杀掉所有运行中的容器）：
 
-  1) 先看看有哪些容器会被重启杀掉：   docker ps
-  2) 重启 dockerd：                   systemctl restart docker
-  3) 确认 runtime 注册上了：          docker info --format '{{.DefaultRuntime}} {{.Runtimes}}'
-  4) 确认 worker 在听：               curl -sS http://127.0.0.1:<port>/sandbox/status
+    docker ps                                     # 先看哪些会被杀
+    systemctl restart docker
+    docker info --format '{{.DefaultRuntime}}'    # 应当输出 neu-box-runtime
 
-注意：重启 dockerd 会杀掉当时所有运行中的容器。
-
-回滚：sudo bash scripts/uninstall.sh
+看配置现状：$CONFIG_BIN show
+回滚：     sudo bash "$ROOT/scripts/uninstall.sh"
 EOF
