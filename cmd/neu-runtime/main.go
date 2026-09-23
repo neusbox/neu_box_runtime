@@ -14,6 +14,12 @@
 //	认识的容器   create 或 run 且 bundle 里 annotations.sandbox_cgroup 非空时
 //	             才动 config.json —— 往 hooks[<phase>] 追加一条 neu-box-hook
 //	             记录；然后 argv 原样交给真 runc。
+//	能力位守卫   所有 create/run 的容器都过（与 annotation 无关）：容器请求了
+//	             全套 capabilities（--privileged / --cap-add=ALL）时，Ascend
+//	             驱动会把它判成 admin 并给它的 mount namespace 建出全量 UDA
+//	             设备表，我们的 eBPF 在那条路径上不在场 —— 隔离会静默失效。
+//	             默认（NEU_BOX_CAP_GUARD=drop）从四个能力集合里剪掉
+//	             CAP_AUDIT_READ，让它掉出 admin；详见 capguard.go。
 //	其余一切     （别的子命令、没 --bundle、config.json 读不了、JSON 坏了、
 //	             没有 annotation…）一律原样转发，一个字节都不动。
 //
@@ -209,6 +215,32 @@ func guardSelfExec(binary string) error {
 // 其余所有看不懂的输入都走原样转发，不返回 error。
 func prepare(args []string, cfg config.Config, stderr io.Writer) ([]string, error) {
 	sub := subcommand(args)
+	if sub == "exec" {
+		// `docker exec` 的能力位不在 bundle 里，而在 containerd 交给
+		// `runc exec --process <file>` 的那份 Process JSON 里 —— 容器 init 的 spec
+		// 我们在 create 时剪过，但 exec 出来的是 docker 按容器自己的 HostConfig
+		// 现算的，所以这条也要单独剪（实测 exec 进程的 CapEff 仍是全量）。
+		processPath := execProcessFile(args)
+		if processPath == "" {
+			// 找不到就剪不了，原样转发（和"看不明白就转发"一个口径）。但要说一声：
+			// 这条路径静默失效的后果是 exec 出来的进程可能仍是 admin。
+			logf(stderr, "exec 没带 --process，找不到进程的 capabilities，原样转发")
+		}
+		changed, err := applyCapGuardToExecProcess(
+			processPath, cfg.CapGuard,
+			func(format string, args ...any) { logf(stderr, format, args...) },
+		)
+		if err != nil {
+			return nil, err
+		}
+		if changed {
+			logf(stderr,
+				"已移除 %s：exec 出的进程带着全套能力位（docker 按容器 HostConfig "+
+					"现算的），Ascend 驱动会把它判成 admin 并建出全量 UDA 设备表",
+				capGuardDropCapability)
+		}
+		return args, nil
+	}
 	if !injectableSubcommands[sub] {
 		return args, nil // 逐字转发，config.json 碰都不碰
 	}
@@ -222,6 +254,24 @@ func prepare(args []string, cfg config.Config, stderr io.Writer) ([]string, erro
 	}
 
 	configPath := filepath.Join(bundle, configFileName)
+
+	// 能力位守卫：**所有**容器都过这一关，不只是沙盒容器。容器带着全套
+	// capabilities（--privileged / --cap-add=ALL）时 Ascend 驱动会把它判成
+	// admin，给这个 mount namespace 建出一张全量 UDA 设备表，而我们 worker 的
+	// eBPF 在那条路径上不在场 —— 沙盒隔离会静默失效。详见 capguard.go 文件头。
+	changed, err := applyCapGuard(configPath, cfg.CapGuard, func(format string, args ...any) {
+		logf(stderr, format, args...)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if changed {
+		logf(stderr,
+			"已移除 %s：%s 请求了全部能力位（等价 --privileged/--cap-add=ALL），"+
+				"Ascend 驱动会把这类容器判成 admin 并建出全量 UDA 设备表，NPU 隔离会失效",
+			capGuardDropCapability, configPath)
+	}
+
 	annotation, err := scanBundle(configPath)
 	if err != nil {
 		// 读不了 / 不是合法 JSON：同样判断不了。这台机器上所有容器都从这条路

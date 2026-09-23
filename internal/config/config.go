@@ -27,6 +27,7 @@ const (
 	EnvHookPath   = "NEU_BOX_HOOK"
 	EnvHookPhase  = "NEU_BOX_HOOK_PHASE"
 	EnvRealRunc   = "NEU_BOX_REAL_RUNC"
+	EnvCapGuard   = "NEU_BOX_CAP_GUARD"
 	EnvConfigPath = "NEU_BOX_CONFIG"
 )
 
@@ -51,6 +52,11 @@ const (
 	DefaultHookPath  = "/usr/local/bin/neu-box-hook"
 	DefaultHookPhase = "createRuntime"
 	DefaultRealRunc  = "/usr/local/bin/runc"
+	// DefaultCapGuard 让 wrapper 剪掉 CAP_AUDIT_READ：容器请求全套能力位
+	// （--privileged / --cap-add=ALL）时 Ascend 驱动会把它判成 admin，建出
+	// 全量 UDA 设备表，沙盒隔离失效。可选值 drop（默认）/ deny / off，
+	// 详见 cmd/neu-runtime/capguard.go 的文件头。
+	DefaultCapGuard = "drop"
 )
 
 // Config 是两个二进制共用的运行配置。
@@ -59,6 +65,7 @@ type Config struct {
 	HookPath  string // neu-box-runtime 写进 OCI hook 记录的 hook 可执行文件
 	HookPhase string // 注入到哪个 OCI hook 阶段
 	RealRunc  string // wrapper 后面真正接的 runtime
+	CapGuard  string // drop（默认）/ deny / off，见 capguard.go
 }
 
 // Default 返回全默认值的配置。
@@ -68,6 +75,7 @@ func Default() Config {
 		HookPath:  DefaultHookPath,
 		HookPhase: DefaultHookPhase,
 		RealRunc:  DefaultRealRunc,
+		CapGuard:  DefaultCapGuard,
 	}
 }
 
@@ -102,8 +110,24 @@ func Load(path string) (Config, error) {
 		EnvHookPath:  os.Getenv(EnvHookPath),
 		EnvHookPhase: os.Getenv(EnvHookPhase),
 		EnvRealRunc:  os.Getenv(EnvRealRunc),
+		EnvCapGuard:  os.Getenv(EnvCapGuard),
 	})
+	if !ValidCapGuard(cfg.CapGuard) {
+		warnings = append(warnings, fmt.Errorf(
+			"%s=%q 不是 drop/deny/off，用默认值 %s",
+			EnvCapGuard, cfg.CapGuard, DefaultCapGuard))
+		cfg.CapGuard = DefaultCapGuard
+	}
 	return cfg, errors.Join(warnings...)
+}
+
+// ValidCapGuard 判断能力位守卫的模式是否认识。
+func ValidCapGuard(mode string) bool {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "drop", "deny", "off":
+		return true
+	}
+	return false
 }
 
 // resolvePath 决定读哪个文件。显式给了路径（参数或 NEU_BOX_CONFIG）就用它，
@@ -135,6 +159,9 @@ func apply(cfg *Config, values map[string]string) {
 	}
 	if v := values[EnvRealRunc]; v != "" {
 		cfg.RealRunc = v
+	}
+	if v := values[EnvCapGuard]; v != "" {
+		cfg.CapGuard = strings.ToLower(strings.TrimSpace(v))
 	}
 }
 

@@ -103,6 +103,26 @@ runtime 和 hook **不碰 BPF、不碰数据库**，只负责把可信的运行�
   create/run、没有 bundle、JSON 坏了）则是另一种情况 —— 一律**原样转发**，
   不能因为自己的问题挡住无关容器。
 - 写回 config.json 后 `exec` 真 runc，argv 原样。
+- **能力位守卫**（与 annotation 无关，所有 `create`/`run` 容器都过）：容器请求
+  了全套 capabilities（`--privileged` / `--cap-add=ALL`）时，Ascend 驱动
+  （`cann/driver`，`src/sdk_driver/pbl/uda/uda_access.c` 的 `uda_is_admin_task`）
+  会把它判成 **admin**：掩码 `ka_system_get_privileged_kernel_cap()` 在 6.3+
+  内核上是 bits 0..37（`CAP_CHOWN`…`CAP_AUDIT_READ`），比较是**超集**判定，
+  所以只有全套能力位才命中。命中的后果是驱动给这个 mount namespace 建一张
+  **全量** UDA 设备表（按 mnt ns 缓存），而 worker 那套 eBPF 只拦
+  `open("/dev/davinciN")`，驱动这条路径不看它 —— 沙盒隔离静默失效（真机实测：
+  申请 2 张卡的容器里 `torch.npu.device_count() == 8`）。
+  默认 `NEU_BOX_CAP_GUARD=drop`：从 bounding/permitted/effective/ambient 四个
+  集合里剪掉 `CAP_AUDIT_READ`（掩码覆盖得到的最后一位，容器几乎不可能用到），
+  容器即掉出 admin 超集，其余能力位不动。于是受管容器只看到沙盒那几张卡、
+  未登记容器一张都看不到（fail-closed）。`deny` 改成拒绝创建，`off` 关闭
+  （排障用）。
+- 能力位守卫也管 **`exec`**：`docker exec` 那份 capability 不在 bundle 里，
+  而是 containerd 交给 `runc exec --process <file>` 的一份 Process JSON，并且是
+  docker 按容器**自己的 HostConfig 现算**的 —— 跟 create 时被我们剪过的那份
+  spec 无关，实测 exec 进程的 `CapEff` 仍是全量。所以 `exec` 子命令上单独剪
+  同一位。exec 的 Process 里没有 user namespace 信息（那是容器级属性），这里
+  不做 userns 判断 —— 多剪一位本来无害。
 
 ## neu-box-hook
 

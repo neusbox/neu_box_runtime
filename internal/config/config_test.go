@@ -31,6 +31,7 @@ func TestDefaults(t *testing.T) {
 		HookPath:  "/usr/local/bin/neu-box-hook",
 		HookPhase: "createRuntime",
 		RealRunc:  "/usr/local/bin/runc",
+		CapGuard:  "drop",
 	}
 	if got != want {
 		t.Fatalf("默认值 = %+v，想要 %+v", got, want)
@@ -39,6 +40,10 @@ func TestDefaults(t *testing.T) {
 	// 换 phase 之前得先有真机验证，不能顺手改。
 	if DefaultHookPhase != "createRuntime" {
 		t.Fatalf("默认 phase = %q：createRuntime 是直连 runc 验过才当默认值的，别乱改", DefaultHookPhase)
+	}
+	// 默认必须是 drop：容器请求全套能力位时驱动会把它判成 admin，隔离会失效。
+	if DefaultCapGuard != "drop" {
+		t.Fatalf("默认 cap guard = %q，必须是 drop（理由见 cmd/neu-runtime/capguard.go）", DefaultCapGuard)
 	}
 }
 
