@@ -30,14 +30,17 @@ docker run --annotation sandbox_cgroup=<name> ...
                         neu-box-hook（stdin 读 OCI state）
                               │ 取容器的真实 cgroup / mnt ns
                               ▼
-                     POST /container/register
+                    POST /container/register
                               │
-                    ┌─────────┴─────────┐
-                 2xx/200            4xx/超时/连不上
-                    │                    │
-              hook 退 0              hook 退非 0
-                    │                    │
-            runc 继续，ENTRYPOINT 执行   runc create 失败，容器不启动
+        ┌─────────────────────┼─────────────────────┐
+     2xx / 200          404 sandbox_not_found    其它 4xx / 5xx / 超时 / 连不上
+        │              409 sandbox_not_active          │
+   hook 退 0            hook 退 0（打警告）          hook 退非 0
+   登记完成          容器无授权启动（0 张卡）              │
+        │                  │                             ▼
+        │                  │                 runc create 失败，容器不启动
+        ▼                  ▼
+    ENTRYPOINT 执行    ENTRYPOINT 执行
 ```
 
 runtime 和 hook **不碰 BPF、不碰数据库**，只负责把可信的运行时身份转交给 Worker。
@@ -135,9 +138,17 @@ runtime 和 hook **不碰 BPF、不碰数据库**，只负责把可信的运行�
 - 向 `<NEU_BOX_WORKER_URL>/container/register` 发请求；body 只有契约里那三个
   必填字段（`container_id` / `host_pid` / `sandbox_cgroup`），字段含义见 worker 仓库
   `docs/worker-api.md`。
-- **成功 → 退 0；任何失败（含 Worker 连不上、超时、4xx）→ 退非 0。**
-  绝不能"登记不上就放行" —— 放行之后容器里会发生什么、为什么补不回来，
-  见 `neu_box_worker/docs/container-registration.md`。
+- **成功 → 退 0。** 例外只有一种：Worker 明确回答"没有这个沙盒 / 这个沙盒正在
+  销毁"（404 `sandbox_not_found` / 409 `sandbox_not_active`）时**放行**，但容器
+  拿不到任何授权 —— BPF 的容器分支查不到委托，`open` 全被拒，驱动给这个 mnt ns
+  建出来的 UDA 表是空的（容器里看不到任何 NPU）。这是 release 之后
+  `docker start` 老容器那条路：容器能起来（可写层还在），要卡得重新 acquire 并
+  重建容器。hook 会往 stderr 打一行明确警告，那是这条路**唯一**的观测点
+  （落在 dockerd/containerd 日志里，容器自己的 `docker logs` 看不到）。
+- **其余任何失败（连不上 Worker、超时、5xx、400、身份冲突 409…）→ 退非 0。**
+  绝不能"登记不上就放行"：放行之后容器里会发生什么、为什么补不回来，见
+  `neu_box_worker/docs/container-registration.md`；而"拿不到答案"那一类更危险 ——
+  `neuboxctl pause` 的窗口里 BPF 是拆掉的，那时的容器会直接把全部卡拿走。
 - 不从 argv 读、也不额外发 `container_cgroup` / `mount_namespace`：那两个值是
   Worker 自己从 `/proc/<pid>` 读真值，hook 再报一遍不提供额外信息，报错了反而
   把登记搞失败（409）。

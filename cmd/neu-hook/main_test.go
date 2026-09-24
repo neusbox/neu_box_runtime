@@ -145,15 +145,59 @@ func TestRunPrefersStateAnnotations(t *testing.T) {
 	}
 }
 
+// 授权的否定答案：Worker 明确说沙盒不存在 / 正在销毁 → 放行，但容器零卡。
+func TestRunAllowsStartWithoutAuthorization(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		code   string
+	}{
+		{
+			"沙盒不存在", 404,
+			`{"error":"sandbox_cgroup 未匹配到 Worker 沙盒","code":"sandbox_not_found"}`,
+			"sandbox_not_found",
+		},
+		{
+			"沙盒正在销毁", 409,
+			`{"error":"沙盒当前不可用","code":"sandbox_not_active"}`,
+			"sandbox_not_active",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server, received := fakeWorker(t, tc.status, tc.body)
+			state := stateJSON(t, map[string]any{
+				"id": "abc", "pid": 7,
+				"annotations": map[string]string{"sandbox_cgroup": "sbx_a"},
+			})
+			var stderr strings.Builder
+			if code := run(strings.NewReader(state), testConfig(server.URL), &stderr); code != 0 {
+				t.Fatalf("该退 0（无授权放行），实际退 %d：%s", code, stderr.String())
+			}
+			if received() == nil {
+				t.Fatal("请求没发出去")
+			}
+			// 警告必须点明"没有卡"，这是这条路唯一的观测点。
+			if !strings.Contains(stderr.String(), "无授权") {
+				t.Fatalf("stderr 没说明容器无授权：%s", stderr.String())
+			}
+			if !strings.Contains(stderr.String(), tc.code) {
+				t.Fatalf("stderr 没带上 Worker 的业务码 %s：%s", tc.code, stderr.String())
+			}
+		})
+	}
+}
+
 func TestRunFailsOnWorkerRejection(t *testing.T) {
-	// 契约里的每一种非 2xx：登记不上就绝不放行。
+	// 拿不到答案 / 身份有问题的非 2xx 一律不放行（404/409 那两种见上一条用例）。
 	cases := []struct {
 		status int
 		body   string
 	}{
 		{400, `{"error":"参数缺失"}`},
-		{404, `{"error":"没这个沙盒","code":"sandbox_not_found"}`},
-		{409, `{"error":"沙盒不 ACTIVE","code":"sandbox_not_active"}`},
+		{404, `{"error":"代理回的 404，没有业务码"}`},
+		{409, `{"error":"容器登记在别的沙盒里","code":"docker_container_registered_elsewhere"}`},
 		{500, `{"error":"炸了"}`},
 		{302, ``},
 	}
@@ -253,7 +297,7 @@ func TestRunFailsOnTimeout(t *testing.T) {
 	// 直接调 register，把超时压到 50ms —— run() 用的是 8s 常量，真等 8s 太慢。
 	body := registerRequest{ContainerID: "abc", HostPID: 7, SandboxCgroup: "sbx_a"}
 	start := time.Now()
-	err := register(stall.URL, body, 50*time.Millisecond)
+	_, err := register(stall.URL, body, 50*time.Millisecond)
 	if err == nil {
 		t.Fatal("超时必须报错")
 	}

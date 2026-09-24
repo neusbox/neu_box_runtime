@@ -4,9 +4,9 @@
 // neu-box-runtime 的包注释），从 stdin 喂一份 OCI state。它取出容器 init 的
 // 宿主机 PID 和 sandbox_cgroup，POST 给 Worker 的 /container/register。
 //
-// 成功退 0，**任何**失败退非 0：绝不能"登记不上就放行"。放行的代价是容器内第一
-// 次 NPU 初始化时驱动建出一张空 UDA 表并按 mnt ns 永久缓存，容器从此坏掉，
-// 事后补登记也修不回来 —— 相比起来，容器直接起不来是好得多的结果。
+// 唯一允许"登记不上还放行"的情况：Worker 明确回答"没有这个沙盒 / 正在销毁"
+// （404 sandbox_not_found / 409 sandbox_not_active）。那时容器起来但零卡（BPF
+// 查不到委托）。其余失败一律退非 0 —— 详见 docs/runtime-hook.md。
 //
 // 它是 runc 拉起来的，不是交互终端：日志一律走 stderr。
 package main
@@ -72,6 +72,30 @@ type registerRequest struct {
 	SandboxCgroup string `json:"sandbox_cgroup"`
 }
 
+// registerOutcome 是登记请求结果里"能用来做判断"的那部分。
+//
+// status 为 0 表示压根没拿到响应（连不上、超时、构造失败…）。code 是 Worker
+// 错误体里的业务码 —— 只有它明确说"沙盒不存在 / 正在销毁"时，hook 才允许放行。
+type registerOutcome struct {
+	status int
+	code   string
+}
+
+// unregisteredAllowed 判断这次拒绝是不是"授权的否定答案"。
+//
+// 只认 Worker 给的业务码：代理/网关也可能还个 404，那属于"拿不到答案"，按失败处理。
+func (outcome registerOutcome) unregisteredAllowed() bool {
+	if outcome.status != http.StatusNotFound &&
+		outcome.status != http.StatusConflict {
+		return false
+	}
+	switch outcome.code {
+	case "sandbox_not_found", "sandbox_not_active":
+		return true
+	}
+	return false
+}
+
 func main() {
 	cfg, warn := config.Load("")
 	if warn != nil {
@@ -102,7 +126,16 @@ func run(stdin io.Reader, cfg config.Config, stderr io.Writer) int {
 		HostPID:       state.Pid,
 		SandboxCgroup: sandbox,
 	}
-	if err := register(cfg.WorkerURL, body, httpTimeout); err != nil {
+	outcome, err := register(cfg.WorkerURL, body, httpTimeout)
+	if err != nil {
+		if outcome.unregisteredAllowed() {
+			// 放行但无授权。这行日志是这条路唯一的观测点（只在 dockerd 日志里）。
+			logf(stderr,
+				"沙盒 %s 已不存在或正在销毁（%s）—— 容器 %s 以**无授权**方式启动："+
+					"容器内看不到任何 NPU。要卡请重新 acquire，并重建容器",
+				sandbox, outcome.code, state.ID)
+			return 0
+		}
 		logf(stderr, "登记容器 %s（沙盒 %s）失败：%v", state.ID, sandbox, err)
 		return 1
 	}
@@ -147,17 +180,20 @@ func sandboxName(state ociState) (string, error) {
 	return value, nil
 }
 
-// register 把登记请求发给 Worker。任何非 2xx 都算失败。
+// register 把登记请求发给 Worker；非 2xx 一律返回 error，同时把状态码和 Worker
+// 的业务码带回去给调用方判断（见 registerOutcome）。
 // timeout 单独传是为了能测：生产路径永远用 httpTimeout。
-func register(workerURL string, body registerRequest, timeout time.Duration) error {
+func register(workerURL string, body registerRequest,
+	timeout time.Duration) (registerOutcome, error) {
+	var outcome registerOutcome
 	payload, err := json.Marshal(body)
 	if err != nil {
-		return fmt.Errorf("序列化请求：%w", err)
+		return outcome, fmt.Errorf("序列化请求：%w", err)
 	}
 	url := strings.TrimSuffix(workerURL, "/") + registerPath
 	request, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
-		return fmt.Errorf("构造请求 %s：%w", url, err)
+		return outcome, fmt.Errorf("构造请求 %s：%w", url, err)
 	}
 	request.Header.Set("Content-Type", "application/json")
 
@@ -166,15 +202,25 @@ func register(workerURL string, body registerRequest, timeout time.Duration) err
 	client := &http.Client{Timeout: timeout}
 	response, err := client.Do(request)
 	if err != nil {
-		return fmt.Errorf("POST %s：%w", url, err)
+		return outcome, fmt.Errorf("POST %s：%w", url, err)
 	}
 	defer response.Body.Close()
 
 	detail, _ := io.ReadAll(io.LimitReader(response.Body, errorBodyLimit))
-	if response.StatusCode < 200 || response.StatusCode > 299 {
-		return fmt.Errorf("POST %s 返回 %s：%s", url, response.Status, strings.TrimSpace(string(detail)))
+	outcome.status = response.StatusCode
+	if outcome.status < 200 || outcome.status > 299 {
+		// 业务码只在错误体里；解析不出来就按"拿不到答案"处理（不放行）。
+		var parsed struct {
+			Code string `json:"code"`
+		}
+		if json.Unmarshal(detail, &parsed) == nil {
+			outcome.code = parsed.Code
+		}
 	}
-	return nil
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		return outcome, fmt.Errorf("POST %s 返回 %s：%s", url, response.Status, strings.TrimSpace(string(detail)))
+	}
+	return outcome, nil
 }
 
 // logf 写 stderr。hook 的 stdout 归 runc，日志一律走 stderr。
